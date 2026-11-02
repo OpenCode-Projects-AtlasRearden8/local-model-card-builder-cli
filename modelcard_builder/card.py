@@ -1,0 +1,198 @@
+"""Render a friendly, readable model card as markdown."""
+from __future__ import annotations
+
+import datetime as _dt
+from pathlib import Path
+
+from .gguf import ModelInfo, BPW, human_size, estimate_parameters
+
+
+def _quant_bpw(quant: str) -> float | None:
+    return BPW.get(quant)
+
+
+def _context_rank(quant: str) -> str:
+    q = quant.upper()
+    if q.startswith("IQ1") or q.startswith("IQ2") or q.startswith("Q2_"):
+        return (
+            "Very compressed: every bit counts. Expect noticeably rougher answers, "
+            "but it can run on very small memory budgets."
+        )
+    if q.startswith("IQ3") or q.startswith("Q3_"):
+        return (
+            "A middle path: noticeably smaller than Q4, with a real dip in quality, "
+            "but often still fine for chat and summaries."
+        )
+    if q.startswith(("Q4_", "IQ4")):
+        return (
+            "The everyday sweet spot: close-to-good quality at roughly a quarter of "
+            "the uncompressed file size. Most people are happiest here."
+        )
+    if q.startswith(("Q5_", "Q6_", "MXFP4")):
+        return "A tall glass: better fidelity than Q4 with a moderate size increase."
+    if q.startswith(("Q8", "Q7")):
+        return "Nearly full quality - just costs almost as much memory as the full model."
+    if q in ("F16", "BF16", "F32"):
+        return "Uncompressed (or nearly): full fidelity, full memory appetite."
+    return (
+        "Quantization is a way of storing the model with slightly fewer decimal places "
+        "so it takes less memory, trading a little accuracy for a lot of convenience."
+    )
+
+
+def _ram_estimate(info: ModelInfo) -> str:
+    base = info.file_size / (1024 ** 3)
+    plus = 2.0 if (info.parameter_count or 12e9) < 8e9 else 3.5
+    low = base + 1.0
+    high = base + plus
+    return f"roughly {low:.1f}-{high:.1f} GB of RAM available (file is {human_size(info.file_size)})"
+
+
+def _suggested_uses(info: ModelInfo) -> list[str]:
+    params = estimate_parameters(info)
+    if params is None:
+        return [
+            "General text work: drafting, rewriting, summarizing.",
+            "Q&A against documents you paste in.",
+            "(Size of the model is unclear, so treat these as starting points.)",
+        ]
+    b = params / 1e9
+    if b < 1.5:
+        return [
+            "Very fast on almost any laptop: quick drafts, autocomplete-style help, simple Q&A.",
+            "Great for trying a model on for size without slowing your machine down.",
+            "Expect shallow reasoning; keep tasks small and specific.",
+        ]
+    if b < 5:
+        return [
+            "Comfortable daily driver for most laptops: chat, summaries, rewriting, brainstorming.",
+            "Solid at following step-by-step instructions written in plain English.",
+            "Good fit for personal notes tidy-up and email drafting.",
+        ]
+    if b < 16:
+        return [
+            "Serious general-purpose model: long documents, multi-step reasoning, coding help.",
+            "Want a machine with a healthy amount of RAM (see above) or a GPU with room.",
+            "Often the best quality-per-GB choice for a 'do everything local' helper.",
+        ]
+    if b < 35:
+        return [
+            "Workstation-class: complex reasoning, long-form writing, code review.",
+            "Plan on a big RAM budget, and maybe a modest quant (Q4_K_M) to fit.",
+        ]
+    return [
+        "Big-rig territory: research-grade work, running on GPUs or lots of RAM.",
+        "For most people, a smaller relative of this model is easier to live with.",
+    ]
+
+
+def _prompt_style(info: ModelInfo) -> list[str]:
+    notes = []
+    if info.chat_template:
+        notes.append(
+            "This file ships its own chat template: use your app's normal chat mode and it will "
+            "handle the formatting. You generally don't need manual system/user markers."
+        )
+    else:
+        notes.append("No built-in chat template found in the file: use chat/instruct mode in your app if output looks odd.")
+    if str(info.architecture).lower().startswith("llama"):
+        notes.append("Llama-family models usually answer best with a short system line like: 'Be concise and friendly.'")
+    if "qwen" in str(info.architecture).lower():
+        notes.append("Qwen-family models tend to handle both English and many other languages well, and follow formatted prompts nicely.")
+    notes.append(
+        "Style tip: give examples. One example of the shape of output you want beats a paragraph of instructions."
+    )
+    return notes
+
+
+def render_card(info: ModelInfo, polished: str | None = None, generated_at: _dt.datetime | None = None) -> str:
+    ts = (generated_at or _dt.datetime.now()).strftime("%Y-%m-%d %H:%M")
+    params = estimate_parameters(info)
+    bpw = _quant_bpw(info.quantization)
+
+    lines: list[str] = []
+    lines.append(f"# Model card: {info.name}")
+    lines.append("")
+    lines.append(
+        "> A friendly one-pager about this model, generated by `modelcard-builder` "
+        "(a free tool from Asdale Dynamics, LLC)."
+    )
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"- **Source:** {info.source}")
+    lines.append(f"- **File:** `{info.file_path}`")
+    lines.append(f"- **File size:** {human_size(info.file_size)}")
+    lines.append(f"- **Architecture:** {info.architecture}")
+    if info.version:
+        lines.append(f"- **Model version/finetune:** {info.version}" + (f" ({info.finetune})" if info.finetune else ""))
+    if info.size_label:
+        lines.append(f"- **Size label:** {info.size_label}")
+    if params:
+        lines.append(f"- **Estimated parameters:** ~{params / 1e9:.1f}B" if params >= 1e9 else f"- **Estimated parameters:** ~{params / 1e6:.0f}M")
+    if info.context_length:
+        lines.append(f"- **Context length:** {info.context_length:,} tokens (roughly {info.context_length // 250:,} pages of plain text)")
+    if info.extras.get("gguf_version"):
+        lines.append(f"- **GGUF version:** {info.extras['gguf_version']} (tensors: {info.extras.get('tensor_count', '-')})")
+    lines.append(f"- **Card generated:** {ts}")
+    lines.append("")
+    lines.append("## Quantization: what it is, and what this one is")
+    lines.append("")
+    lines.append(f"**This file is: `{info.quantization}`**" + (f" (about {bpw:.1f} bits per weight)" if bpw else ""))
+    lines.append("")
+    lines.append(_context_rank(info.quantization))
+    if info.extras.get("quantization_source") == "filename":
+        lines.append("")
+        lines.append("_(Read from the filename; the file itself did not label its quantization.)_")
+    lines.append("")
+    lines.append("## Practical use-cases")
+    lines.append("")
+    for use in _suggested_uses(info):
+        lines.append(f"- {use}")
+    lines.append("")
+    lines.append("## Running it: what you need")
+    lines.append("")
+    lines.append(f"- Memory: {_ram_estimate(info)}")
+    if info.context_length:
+        lines.append(
+            f"- Longer answers cost more memory: the {info.context_length:,}-token context is the "
+            "notice board the model reads from. Start with a short notice board; only raise it if you need big documents."
+        )
+    lines.append("- Tooling: LM Studio, Ollama, llama.cpp, or similar can run GGUF files directly.")
+    lines.append("")
+    lines.append("## Prompt style notes")
+    lines.append("")
+    for note in _prompt_style(info):
+        lines.append(f"- {note}")
+    lines.append("")
+    if polished:
+        lines.append("## LLM polish (written by your local model)")
+        lines.append("")
+        lines.append(polished.strip())
+        lines.append("")
+    lines.append("## My notes")
+    lines.append("")
+    lines.append("_Edit this section freely - it is yours._")
+    lines.append("")
+    lines.append("- Use cases I actually tried:")
+    lines.append("")
+    lines.append("  - [ ] ")
+    lines.append("")
+    lines.append("- Prompts that worked well with this model:")
+    lines.append("")
+    lines.append("  ```")
+    lines.append("  ")
+    lines.append("  ```")
+    lines.append("")
+    lines.append("- Prompts that failed or annoyed me:")
+    lines.append("")
+    lines.append("  ```")
+    lines.append("  ")
+    lines.append("  ```")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def card_filename(info: ModelInfo) -> str:
+    base = "".join(c if c.isalnum() or c in "-_ " else "_" for c in info.name)
+    return f"{base.strip() or 'model'} card.md".replace(" ", "_").lower()
